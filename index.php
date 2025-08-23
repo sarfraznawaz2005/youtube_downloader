@@ -108,9 +108,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
             // Build command using array format to avoid shell escaping issues
             $format_selector = $quality;
-            if ($quality === 'best') {
-                $format_selector = 'bestvideo+bestaudio/best';
-            } else if (strpos($quality, ',') !== false) {
+            if (strpos($quality, ',') !== false) {
                 $parts = explode(',', $quality);
                 $format_selector = $parts[0] . '+' . $parts[1];
             }
@@ -801,6 +799,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             if (!currentVideoData) return;
 
             const selectedQuality = modalQuality.value;
+            if (!selectedQuality) {
+                showMessage('Please select a quality', 'error', modalQuality);
+                return;
+            }
+
             videoModal.style.display = 'none';
             
             downloadInProgress = true;
@@ -866,31 +869,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             // Clear existing options
             modalQuality.innerHTML = '';
 
-            // Add a "Best Quality" option
-            const bestOption = document.createElement('option');
-            bestOption.value = 'best';
-            bestOption.selected = true;
-
-            // Calculate estimated size for "Best Quality"
-            let best_video_size = 0;
-            let best_audio_size = 0;
-
-            if (formats.length > 0) {
-                // Find the best video format (highest height)
-                const best_video_format = formats.reduce((prev, current) => (prev.height > current.height) ? prev : current);
-                best_video_size = best_video_format.filesize;
-
-                // Find the best audio format (assuming it's the one with the largest size among audio-only streams)
-                // This requires re-fetching audio formats from the raw data if not already available in 'formats'
-                // For simplicity, let's assume currentVideoData has a way to get all audio formats
-                // Or, we can just use the audio_filesize from the best_video_format if it's paired.
-                best_audio_size = best_video_format.audio_filesize;
-            }
-
-            const estimated_best_total_filesize = (best_video_size + best_audio_size) / 1024 / 1024;
-            const best_filesize_text = estimated_best_total_filesize > 0 ? `(${(estimated_best_total_filesize).toFixed(2)} MB)` : '';
-            bestOption.textContent = `Best Quality ${best_filesize_text}`;
-            modalQuality.appendChild(bestOption);
+            // Add a "Choose Quality" option
+            const chooseOption = document.createElement('option');
+            chooseOption.value = '';
+            chooseOption.textContent = '-- Choose Quality --';
+            chooseOption.selected = true;
+            chooseOption.disabled = true;
+            modalQuality.appendChild(chooseOption);
 
             // Add available qualities
             formats.forEach(format => {
@@ -1053,7 +1038,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             loadingOverlay.style.display = show ? 'flex' : 'none';
         }
 
-        function showMessage(message, type) {
+        function showMessage(message, type, targetElement = null) {
             // Remove existing messages
             const existingMessages = document.querySelectorAll('.error, .success');
             existingMessages.forEach(msg => msg.remove());
@@ -1062,7 +1047,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             messageDiv.className = type;
             messageDiv.textContent = message;
             
-            form.insertBefore(messageDiv, form.firstChild);
+            if (targetElement) {
+                targetElement.parentNode.insertBefore(messageDiv, targetElement);
+            } else {
+                form.insertBefore(messageDiv, form.firstChild);
+            }
         }
 
         // Modal event listeners
