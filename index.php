@@ -26,44 +26,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             
             $command = escapeshellcmd($ytdlp_path) . ' --dump-json --no-playlist ' . escapeshellarg($url) . ' 2>&1';
             $output = shell_exec($command);
-            
+            file_put_contents('ytdlp_output.log', $output);
+
             // Kill any remaining yt-dlp processes
             if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
                 shell_exec('taskkill /F /IM yt-dlp.exe 2>nul');
-            } else {
-                shell_exec('pkill -f yt-dlp 2>/dev/null');
             }
-            
+
             if ($output) {
                 $info = json_decode($output, true);
                 if ($info) {
                     $formats = [];
+                    $audio_formats = [];
+
+                    foreach ($info['formats'] as $format) {
+                        if ($format['vcodec'] === 'none' && $format['acodec'] !== 'none') {
+                            $audio_formats[] = $format;
+                        }
+                    }
+
                     foreach ($info['formats'] as $format) {
                         if (isset($format['height']) && $format['vcodec'] !== 'none') {
+                            // Find the best corresponding audio format
+                            $best_audio = null;
+                            foreach ($audio_formats as $audio_format) {
+                                if ($audio_format['ext'] === $format['ext'] || $format['ext'] === 'mp4') {
+                                    if ($best_audio === null || $audio_format['filesize'] > $best_audio['filesize']) {
+                                        $best_audio = $audio_format;
+                                    }
+                                }
+                            }
+
                             $formats[] = [
                                 'format_id' => $format['format_id'],
                                 'height' => $format['height'],
                                 'ext' => $format['ext'],
-                                'filesize' => $format['filesize'] ?? 0
+                                'filesize' => $format['filesize'] ?? $format['filesize_approx'] ?? 0,
+                                'audio_format_id' => $best_audio['format_id'] ?? null,
+                                'audio_filesize' => $best_audio['filesize'] ?? $best_audio['filesize_approx'] ?? 0
                             ];
                         }
                     }
-                    
+
                     // Sort by height
                     usort($formats, function($a, $b) {
                         return $b['height'] - $a['height'];
                     });
-                    
+
                     echo json_encode([
                         'title' => $info['title'] ?? 'Unknown',
                         'duration' => $info['duration'] ?? 0,
                         'formats' => $formats
                     ]);
                 } else {
-                    echo json_encode(['error' => 'Failed to parse video info']);
+                    echo json_encode(['error' => 'Failed to parse video info. Raw output: ' . $output]);
                 }
             } else {
-                echo json_encode(['error' => 'Failed to get video info']);
+                echo json_encode(['error' => 'Failed to get video info. No output from yt-dlp.']);
             }
             exit;
             
@@ -72,102 +91,121 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $quality = $_POST['quality'] ?? '';
             $download_path = trim($_POST['download_path'] ?? $default_downloads_path);
             $is_playlist = $_POST['is_playlist'] ?? 'false';
-            
+
             if (empty($url)) {
                 echo json_encode(['error' => 'URL is required']);
                 exit;
             }
-            
+
             if (!is_dir($download_path)) {
                 echo json_encode(['error' => 'Download path does not exist']);
                 exit;
             }
-            
+
+            $session_id = session_id();
+            $progress_file = __DIR__ . '/progress_' . $session_id . '.log';
+            $_SESSION['progress_file'] = $progress_file;
+
             // Build command using array format to avoid shell escaping issues
-            $format_selector = $quality === 'best' ? 'best' : "best[height<=" . intval($quality) . "]";
-            $playlist_flag = $is_playlist === 'true' ? '' : '--no-playlist';
+            $format_selector = $quality;
+            if ($quality === 'best') {
+                $format_selector = 'bestvideo+bestaudio/best';
+            } else if (strpos($quality, ',') !== false) {
+                $parts = explode(',', $quality);
+                $format_selector = $parts[0] . '+' . $parts[1];
+            }
             
+            $playlist_flag = $is_playlist === 'true' ? '' : '--no-playlist';
+            $ffmpeg_path = __DIR__ . DIRECTORY_SEPARATOR . 'ffmpeg' . DIRECTORY_SEPARATOR . 'ffmpeg.exe';
+
             // Properly construct the command without over-escaping the template
             $safe_download_path = rtrim($download_path, '/\\');
-            
+
             // Build command array - this avoids shell escaping issues
+            $o = $safe_download_path . DIRECTORY_SEPARATOR . '%(title)s.%(ext)s';
             $cmd_array = [
                 $ytdlp_path,
                 '-f', $format_selector,
-                '-o', $safe_download_path . DIRECTORY_SEPARATOR . '%(title)s.%(ext)s',
+                '-o', $o,
+                '--ffmpeg-location', $ffmpeg_path,
                 '--newline',
                 '--progress',
                 '--force-overwrites'  // Always force to avoid "already downloaded" issues
             ];
-            
+
             if ($playlist_flag) {
                 $cmd_array[] = $playlist_flag;
             }
-            
+
             $cmd_array[] = $url;
-            
-            // Store command array in session for progress tracking
-            $_SESSION['download_command_array'] = $cmd_array;
-            $_SESSION['download_active'] = true;
-            
+
+            $command = escapeshellarg($ytdlp_path) .
+                ' -f ' . escapeshellarg($format_selector) .
+                ' -o "' . $o . '"' . // Manually quote the output template
+                ' --ffmpeg-location ' . escapeshellarg($ffmpeg_path) .
+                ' --newline' .
+                ' --progress' .
+                ' --force-overwrites';
+
+            if ($playlist_flag) {
+                $command .= ' ' . $playlist_flag;
+            }
+
+            $command .= ' ' . escapeshellarg($url);
+
+            file_put_contents('ytdlp_command.log', $command);
+
+            $descriptorspec = array(
+                0 => array("pipe", "r"),  // stdin
+                1 => array("pipe", "w"),  // stdout
+                2 => array("pipe", "w")   // stderr
+            );
+
+            if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                $process = proc_open($command . ' > "' . $progress_file . '" 2>&1', $descriptorspec, $pipes);
+            } else {
+                $process = proc_open($command . ' > "' . $progress_file . '" 2>&1 &', $descriptorspec, $pipes);
+            }
+
+            if (is_resource($process)) {
+                $status = proc_get_status($process);
+                $_SESSION['pid'] = $status['pid'];
+                // Close pipes to allow the process to run in the background
+                fclose($pipes[0]);
+                fclose($pipes[1]);
+                fclose($pipes[2]);
+            }
+
             echo json_encode(['success' => true, 'message' => 'Download started']);
             exit;
             
         case 'progress':
-            if (isset($_SESSION['download_command_array']) && $_SESSION['download_active']) {
-                $cmd_array = $_SESSION['download_command_array'];
-                
-                // Check if yt-dlp exists
-                if (!file_exists($cmd_array[0])) {
-                    echo json_encode(['error' => 'yt-dlp.exe not found at: ' . $cmd_array[0]]);
-                    exit;
-                }
-                
-                // Use proc_open for better control over the process
-                $descriptorspec = array(
-                    0 => array("pipe", "r"),  // stdin
-                    1 => array("pipe", "w"),  // stdout
-                    2 => array("pipe", "w")   // stderr
-                );
-                
-                $process = proc_open($cmd_array, $descriptorspec, $pipes);
-                
-                if (is_resource($process)) {
-                    // Close stdin as we don't need it
-                    fclose($pipes[0]);
-                    
-                    // Read stdout and stderr
-                    $output = stream_get_contents($pipes[1]);
-                    $error = stream_get_contents($pipes[2]);
-                    
-                    fclose($pipes[1]);
-                    fclose($pipes[2]);
-                    
-                    // Wait for the process to finish
-                    $return_value = proc_close($process);
-                    
-                    $_SESSION['download_active'] = false;
-                    
-                    // Kill any remaining yt-dlp processes
-                    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-                        shell_exec('taskkill /F /IM yt-dlp.exe 2>nul');
-                    } else {
-                        shell_exec('pkill -f yt-dlp 2>/dev/null');
-                    }
-                    
-                    $full_output = trim($output . "\n" . $error);
-                    
-                    if ($return_value !== 0 || strpos($full_output, 'ERROR') !== false) {
-                        echo json_encode(['error' => $full_output]);
-                    } else {
-                        echo json_encode(['success' => true, 'output' => $full_output]);
-                    }
+            if (isset($_SESSION['progress_file'])) {
+                $progress_file = $_SESSION['progress_file'];
+                if (file_exists($progress_file)) {
+                    $output = file_get_contents($progress_file);
+                    echo json_encode(['success' => true, 'output' => $output]);
                 } else {
-                    echo json_encode(['error' => 'Failed to start download process']);
+                    echo json_encode(['success' => true, 'output' => 'Starting download...']);
                 }
             } else {
                 echo json_encode(['error' => 'No active download']);
             }
+            exit;
+
+        case 'delete_logs':
+            $session_id = session_id();
+            $progress_file = __DIR__ . '/progress_' . $session_id . '.log';
+            if (file_exists($progress_file)) {
+                unlink($progress_file);
+            }
+            if (file_exists('ytdlp_output.log')) {
+                unlink('ytdlp_output.log');
+            }
+            if (file_exists('ytdlp_command.log')) {
+                unlink('ytdlp_command.log');
+            }
+            echo json_encode(['success' => true, 'message' => 'Log files deleted.']);
             exit;
     }
     } catch (Exception $e) {
@@ -186,6 +224,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>YouTube Video Downloader</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico" />
     <style>
         * {
             margin: 0;
@@ -336,6 +375,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             border-radius: 20px;
             text-align: center;
             box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+        }
+
+        .progress-circle {
+            width: 150px;
+            height: 150px;
+            border-radius: 50%;
+            background: conic-gradient(#667eea 0deg, #e0e0e0 0deg);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            position: relative;
+        }
+
+        .progress-circle::before {
+            content: "";
+            position: absolute;
+            width: 130px;
+            height: 130px;
+            background: white;
+            border-radius: 50%;
+        }
+
+        .progress-circle-text {
+            position: relative;
+            font-size: 2em;
+            font-weight: 600;
+            color: #555;
         }
 
         .spinner {
@@ -497,6 +564,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             background: white;
         }
 
+        .progress-container {
+            margin-bottom: 25px;
+        }
+
+        .progress-bar-container {
+            width: 100%;
+            background-color: #e0e0e0;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            width: 0%;
+            height: 20px;
+            background-color: #667eea;
+            border-radius: 10px;
+            transition: width 0.2s ease-in-out;
+        }
+
+        .progress-text {
+            text-align: center;
+            margin-top: 5px;
+            font-weight: 600;
+            color: #555;
+        }
+
         .modal-actions {
             display: flex;
             gap: 15px;
@@ -583,11 +676,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 <label for="isPlaylist">Download as playlist (if URL contains playlist)</label>
             </div>
 
-            <div class="form-group">
-                <label for="status">Download Status:</label>
-                <textarea id="status" readonly placeholder="Download status will appear here..."></textarea>
-            </div>
-
             <button type="submit" class="btn" id="downloadBtn">
                 🔥 Download Video
             </button>
@@ -597,8 +685,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     <!-- Loading Overlay -->
     <div class="loading-overlay" id="loadingOverlay">
         <div class="loading-content">
-            <div class="spinner"></div>
-            <div>Getting video information...</div>
+            <div class="progress-circle" id="progressCircle">
+                <div class="progress-circle-text" id="progressCircleText">0%</div>
+            </div>
+            <div class="spinner" id="loadingSpinner"></div>
+            <div id="loadingMessage">Getting video information...</div>
         </div>
     </div>
 
@@ -620,7 +711,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     <select id="modalQuality" name="modalQuality">
                     </select>
                 </div>
-                
+
+                <div class="progress-container" style="display: none;">
+                    <div class="progress-bar-container">
+                        <div class="progress-bar"></div>
+                    </div>
+                    <div class="progress-text"></div>
+                </div>
+
                 <div class="modal-actions">
                     <button type="button" class="btn-modal btn-secondary" id="cancelDownload">Cancel</button>
                     <button type="button" class="btn-modal btn-primary" id="startDownload">🔥 Download Now</button>
@@ -634,7 +732,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         const urlInput = document.getElementById('url');
         const downloadPathInput = document.getElementById('downloadPath');
         const isPlaylistCheckbox = document.getElementById('isPlaylist');
-        const statusTextarea = document.getElementById('status');
         const downloadBtn = document.getElementById('downloadBtn');
         
         // Loading overlay
@@ -649,6 +746,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         const cancelDownload = document.getElementById('cancelDownload');
         const startDownload = document.getElementById('startDownload');
 
+        let progressInterval = null;
         let downloadInProgress = false;
         let currentVideoData = null;
 
@@ -656,6 +754,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
             
+            // Remove existing messages
+            const existingMessages = document.querySelectorAll('.error, .success');
+            existingMessages.forEach(msg => msg.remove());
+
             if (downloadInProgress) {
                 showMessage('Download already in progress', 'error');
                 return;
@@ -703,8 +805,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             
             downloadInProgress = true;
             downloadBtn.disabled = true;
-            statusTextarea.value = 'Starting download...\n';
-            showLoadingOverlay(true, 'Downloading video...');
+            urlInput.disabled = true;
+            downloadPathInput.disabled = true;
+            isPlaylistCheckbox.disabled = true;
+
+            showLoadingOverlay(true, 'Starting download...');
 
             const formData = new FormData();
             formData.append('action', 'download');
@@ -723,20 +828,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 
                 if (data.error) {
                     showMessage(data.error, 'error');
-                    statusTextarea.value += 'Error: ' + data.error + '\n';
                     downloadInProgress = false;
                     downloadBtn.disabled = false;
+                    urlInput.disabled = false;
+                    downloadPathInput.disabled = false;
+                    isPlaylistCheckbox.disabled = false;
                     showLoadingOverlay(false);
                 } else {
-                    statusTextarea.value += 'Download initiated...\n';
                     // Start checking progress
-                    checkProgress();
+                    progressInterval = setInterval(checkProgress, 1000);
                 }
             } catch (error) {
                 showMessage('Failed to start download: ' + error.message, 'error');
-                statusTextarea.value += 'Failed to start download: ' + error.message + '\n';
                 downloadInProgress = false;
                 downloadBtn.disabled = false;
+                urlInput.disabled = false;
+                downloadPathInput.disabled = false;
+                isPlaylistCheckbox.disabled = false;
                 showLoadingOverlay(false);
             }
         });
@@ -755,32 +863,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         }
 
         function updateModalQualityOptions(formats) {
-            // Clear existing options except "Best Quality"
-            while (modalQuality.children.length > 1) {
-                modalQuality.removeChild(modalQuality.lastChild);
-            }
-            
+            // Clear existing options
+            modalQuality.innerHTML = '';
+
+            // Add a "Best Quality" option
+            const bestOption = document.createElement('option');
+            bestOption.value = 'best';
+            bestOption.textContent = 'Best Quality';
+            bestOption.selected = true;
+            modalQuality.appendChild(bestOption);
+
             // Add available qualities
-            const uniqueHeights = [...new Set(formats.map(f => f.height))].sort((a, b) => b - a);
-            
-            uniqueHeights.forEach(height => {
+            formats.forEach(format => {
                 const option = document.createElement('option');
-                option.value = height;
-                option.textContent = `${height}p`;
+                option.value = `${format.format_id},${format.audio_format_id}`;
+                const total_filesize = (format.filesize + format.audio_filesize) / 1024 / 1024;
+                const filesize_text = total_filesize > 0 ? `(${(total_filesize).toFixed(2)} MB)` : '';
+                option.textContent = `${format.height}p - ${format.ext} ${filesize_text}`;
                 modalQuality.appendChild(option);
             });
-            
-            // Select 720p by default if available
-            const has720p = uniqueHeights.includes(720);
-            if (has720p) {
-                modalQuality.value = '720';
-            } else if (uniqueHeights.length > 0) {
-                // Select the closest quality to 720p
-                const closest720p = uniqueHeights.reduce((prev, curr) => {
-                    return Math.abs(curr - 720) < Math.abs(prev - 720) ? curr : prev;
-                });
-                modalQuality.value = closest720p;
-            }
         }
 
         async function checkProgress() {
@@ -796,29 +897,140 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 const data = await response.json();
                 
                 if (data.error) {
-                    statusTextarea.value += 'Error: ' + data.error + '\n';
                     showMessage(data.error, 'error');
-                } else if (data.success) {
-                    statusTextarea.value += data.output + '\n';
-                    showMessage('Download completed successfully!', 'success');
+                    clearInterval(progressInterval);
+                    downloadInProgress = false;
+                    downloadBtn.disabled = false;
+                    urlInput.disabled = false;
+                    downloadPathInput.disabled = false;
+                    isPlaylistCheckbox.disabled = false;
+                    showLoadingOverlay(false);
+                    return;
                 }
-                
-                downloadInProgress = false;
-                downloadBtn.disabled = false;
-                showLoadingOverlay(false);
-                statusTextarea.scrollTop = statusTextarea.scrollHeight;
+
+                if (data.success) {
+                    const output = data.output;
+                    let message = 'Processing...';
+                    let finished = false;
+                    let percentage = null;
+
+                    const lines = output.split('\n');
+                    const downloadLines = lines.filter(line => line.includes('[download]'));
+                    const mergerLines = lines.filter(line => line.includes('[Merger]'));
+                    const deleteLines = lines.filter(line => line.includes('Deleting original file'));
+
+                    if (mergerLines.length > 0) {
+                        message = 'Merging files...';
+                    } else if (downloadLines.length > 0) {
+                        const lastDownloadLine = downloadLines[downloadLines.length - 1];
+                        const progressMatch = lastDownloadLine.match(/\s+([\d\.]+)\%/);
+                        if (progressMatch) {
+                            percentage = parseFloat(progressMatch[1]);
+                            
+                            const destinationLines = downloadLines.filter(line => line.includes('Destination'));
+                            const lastDestinationLine = destinationLines[destinationLines.length - 1] || '';
+                            const filenameMatch = lastDestinationLine.match(/Destination: (.*)/);
+                            let filename = '';
+                            if (filenameMatch) {
+                                // Extract the filename and remove the path
+                                const fullPath = filenameMatch[1];
+                                filename = fullPath.split(/[\\/]/).pop();
+                            }
+                            
+                            message = `Downloading ${filename}`;
+                        } else {
+                            message = lastDownloadLine.replace('[download]', '').trim();
+                        }
+                    } else if (lines.length > 0) {
+                        message = lines[lines.length - 2] || 'Starting...';
+                    }
+
+                    // Check for completion
+                    if (output.includes('has already been downloaded')) {
+                        finished = true;
+                        message = 'Download completed successfully!';
+                    } else if (deleteLines.length > 0) {
+                        // If we are merging, we need to wait for the original files to be deleted.
+                        if (mergerLines.length > 0) {
+                            // We expect to see two "Deleting original file" messages when merging
+                            if (deleteLines.length >= 2) {
+                                finished = true;
+                                message = 'Download completed successfully!';
+                            }
+                        } else {
+                            // If not merging, one "Deleting original file" is enough
+                            finished = true;
+                            message = 'Download completed successfully!';
+                        }
+                    } else if (downloadLines.length > 0 && !mergerLines.length > 0) {
+                        // Handle the case where there is no merging, and the download is 100%
+                        const lastDownloadLine = downloadLines[downloadLines.length - 1];
+                        if (lastDownloadLine.includes('100%')) {
+                           // We need to make sure this is not the first file of a merge
+                            const downloadCount = output.match(/\\[download\\] Destination/g)?.length || 0;
+                            if (downloadCount === 1) {
+                                if (modalQuality.value === 'best') {
+                                    finished = true;
+                                    message = 'Download completed successfully!';
+                                }
+                            }
+                        }
+                    }
+
+
+                    showLoadingOverlay(true, message, percentage);
+
+                    if (finished) {
+                        showMessage('Download completed successfully!', 'success');
+                        clearInterval(progressInterval);
+                        downloadInProgress = false;
+                        downloadBtn.disabled = false;
+                        urlInput.disabled = false;
+                        downloadPathInput.disabled = false;
+                        isPlaylistCheckbox.disabled = false;
+                        showLoadingOverlay(false);
+
+                        // Delete log files
+                        fetch('', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                            },
+                            body: 'action=delete_logs'
+                        });
+                    }
+                }
             } catch (error) {
-                statusTextarea.value += 'Progress check failed: ' + error.message + '\n';
                 showMessage('Failed to check progress: ' + error.message, 'error');
+                clearInterval(progressInterval);
                 downloadInProgress = false;
                 downloadBtn.disabled = false;
+                urlInput.disabled = false;
+                downloadPathInput.disabled = false;
+                isPlaylistCheckbox.disabled = false;
                 showLoadingOverlay(false);
             }
         }
 
-        function showLoadingOverlay(show, message = 'Getting video information...') {
-            const loadingContent = loadingOverlay.querySelector('.loading-content div:last-child');
-            loadingContent.textContent = message;
+        function showLoadingOverlay(show, message = 'Getting video information...', percentage = null) {
+            const loadingMessage = document.getElementById('loadingMessage');
+            const progressCircle = document.getElementById('progressCircle');
+            const progressCircleText = document.getElementById('progressCircleText');
+            const loadingSpinner = document.getElementById('loadingSpinner');
+
+            loadingMessage.textContent = message;
+
+            if (percentage !== null) {
+                progressCircle.style.display = 'flex';
+                loadingSpinner.style.display = 'none';
+                const angle = percentage * 3.6;
+                progressCircle.style.background = `conic-gradient(#667eea ${angle}deg, #e0e0e0 0deg)`;
+                progressCircleText.textContent = `${Math.round(percentage)}%`;
+            } else {
+                progressCircle.style.display = 'none';
+                loadingSpinner.style.display = 'block';
+            }
+
             loadingOverlay.style.display = show ? 'flex' : 'none';
         }
 
@@ -832,13 +1044,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             messageDiv.textContent = message;
             
             form.insertBefore(messageDiv, form.firstChild);
-            
-            // Auto-remove after 5 seconds
-            setTimeout(() => {
-                if (messageDiv.parentNode) {
-                    messageDiv.remove();
-                }
-            }, 5000);
         }
 
         // Modal event listeners
