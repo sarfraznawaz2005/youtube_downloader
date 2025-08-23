@@ -869,8 +869,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             // Add a "Best Quality" option
             const bestOption = document.createElement('option');
             bestOption.value = 'best';
-            bestOption.textContent = 'Best Quality';
             bestOption.selected = true;
+
+            // Calculate estimated size for "Best Quality"
+            let best_video_size = 0;
+            let best_audio_size = 0;
+
+            if (formats.length > 0) {
+                // Find the best video format (highest height)
+                const best_video_format = formats.reduce((prev, current) => (prev.height > current.height) ? prev : current);
+                best_video_size = best_video_format.filesize;
+
+                // Find the best audio format (assuming it's the one with the largest size among audio-only streams)
+                // This requires re-fetching audio formats from the raw data if not already available in 'formats'
+                // For simplicity, let's assume currentVideoData has a way to get all audio formats
+                // Or, we can just use the audio_filesize from the best_video_format if it's paired.
+                best_audio_size = best_video_format.audio_filesize;
+            }
+
+            const estimated_best_total_filesize = (best_video_size + best_audio_size) / 1024 / 1024;
+            const best_filesize_text = estimated_best_total_filesize > 0 ? `(${(estimated_best_total_filesize).toFixed(2)} MB)` : '';
+            bestOption.textContent = `Best Quality ${best_filesize_text}`;
             modalQuality.appendChild(bestOption);
 
             // Add available qualities
